@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 # -- coding: utf-8 --
 """
-Termostato activado por aplausos con registro de datos en CSV.
+Termostato activado por aplausos con registro de datos en MySQL.
 Compatible con Raspberry Pi 3 + Python 3.5.3 + GrovePi.
 
-    1 aplauso  -> Mide temperatura/humedad durante 10s y la guarda en el CSV.
+    1 aplauso  -> Mide temperatura/humedad durante 10s y guarda el promedio
+                  en la base de datos.
     2 aplausos -> Muestra la ultima medida en el LCD (cian) e imprime el
                   historial completo en la consola (orden cronologico).
-    3 aplausos -> Borra el archivo de historial, pita muy largo y muestra
-                  "Datos Borrados" en rojo.
+    3 aplausos -> Borra todos los registros de la base de datos, pita muy
+                  largo y muestra "Datos Borrados" en rojo.
+
+Nota: la base de datos MySQL vive en tu PC, no en la Raspberry Pi. La Pi
+se conecta a ella por la red local usando la libreria "pymysql".
 """
 
-import os
-import csv
 import math
 import time
+import pymysql
 import grovepi
 from datetime import datetime
 
@@ -32,7 +35,6 @@ PUERTO_SONIDO = 0
 PUERTO_BUZZER = 7
 
 UMBRAL_SONIDO = 650
-ARCHIVO_DATOS = "datos_clima.csv"
 
 TIEMPO_DEBOUNCE = 0.3
 VENTANA_CONTEO = 1.5
@@ -40,6 +42,12 @@ VENTANA_CONTEO = 1.5
 TEMP_MIN, TEMP_MAX = -10, 60
 HUM_MIN, HUM_MAX = 0, 100
 
+# Datos de conexion a MySQL
+DB_HOST = "192.168.1.12"       # <--- Tu IP correcta
+DB_PORT = 3306
+DB_USER = "grovepi_user"
+DB_PASSWORD = "1234"           # <--- Tu contraseña corregida
+DB_NAME = "datos_clima"
 
 # ------------------------------ Capa de hardware -----------------------------
 def configurar_hardware():
@@ -55,6 +63,32 @@ def configurar_hardware():
             time.sleep(0.3)
     print("Aviso: no se pudo inicializar el buzzer tras varios intentos.")
     return False
+
+
+def conectar_bd():
+    """Abre una conexion a MySQL y garantiza que la tabla 'mediciones'
+    exista. Se llama una vez por operacion."""
+    conexion = pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+    )
+    cursor = conexion.cursor()
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS mediciones (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            fecha_hora VARCHAR(19) NOT NULL,
+            temperatura_c FLOAT NOT NULL,
+            humedad_porc FLOAT NOT NULL
+        )
+        """
+    )
+    conexion.commit()
+    cursor.close()
+    return conexion
 
 
 def lcd_mostrar(linea1, linea2="", color=(255, 255, 255)):
@@ -115,7 +149,7 @@ def leer_dht():
 
 # -------------------------------- Acciones ----------------------------------
 def ejecutar_medicion_10s():
-    """1 aplauso: mide 10s (5 lecturas cada 2s) y guarda el promedio en el CSV."""
+    """1 aplauso: mide 10s (5 lecturas cada 2s) y guarda el promedio en la BD."""
     print("\n[1 aplauso] Midiendo temperatura durante 10 segundos...")
     lcd_mostrar("Midiendo...", "Espere 10s", (0, 128, 255))
 
@@ -137,26 +171,27 @@ def ejecutar_medicion_10s():
         lcd_apagar()
         return
 
-    prom_t = sum(temperaturas) / len(temperaturas)
-    prom_h = sum(humedades) / len(humedades)
+    prom_t = round(sum(temperaturas) / len(temperaturas), 1)
+    prom_h = round(sum(humedades) / len(humedades), 1)
     pitido(0.4)
 
-    nueva_fila = [
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "{:.1f}".format(prom_t),
-        "{:.1f}".format(prom_h),
-    ]
-    necesita_encabezado = (
-        not os.path.exists(ARCHIVO_DATOS) or os.path.getsize(ARCHIVO_DATOS) == 0
-    )
-    with open(ARCHIVO_DATOS, "a", newline="") as f:
-        escritor = csv.writer(f)
-        if necesita_encabezado:
-            escritor.writerow(["fecha_hora", "temperatura_c", "humedad_porc"])
-        escritor.writerow(nueva_fila)
+    fecha_hora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conexion = conectar_bd()
+        cursor = conexion.cursor()
+        cursor.execute(
+            "INSERT INTO mediciones (fecha_hora, temperatura_c, humedad_porc) VALUES (%s, %s, %s)",
+            (fecha_hora, prom_t, prom_h),
+        )
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        print("-> Medidas guardadas exitosamente en la base de datos.")
+        lcd_mostrar("Guardado!", "T:{:.1f}C H:{:.1f}%".format(prom_t, prom_h), (0, 255, 0))
+    except pymysql.MySQLError as e:
+        print("-> Error al guardar en MySQL: {}".format(e))
+        lcd_mostrar("Error BD", "Sin conexion", (255, 0, 0))
 
-    print("-> Medidas guardadas exitosamente.")
-    lcd_mostrar("Guardado!", "T:{:.1f}C H:{:.1f}%".format(prom_t, prom_h), (0, 255, 0))
     time.sleep(3)
     lcd_apagar()
 
@@ -165,29 +200,36 @@ def mostrar_mediciones():
     """2 aplausos: imprime el historial completo y muestra la ultima medida."""
     print("\n[2 aplausos] Mostrando mediciones guardadas...")
 
-    if not os.path.exists(ARCHIVO_DATOS) or os.path.getsize(ARCHIVO_DATOS) == 0:
-        lcd_mostrar("Sin datos", "Archivo vacio", (255, 255, 0))
+    try:
+        conexion = conectar_bd()
+        cursor = conexion.cursor()
+        cursor.execute(
+            "SELECT fecha_hora, temperatura_c, humedad_porc FROM mediciones ORDER BY id ASC"
+        )
+        filas = cursor.fetchall()
+        cursor.close()
+        conexion.close()
+    except pymysql.MySQLError as e:
+        print("-> Error al leer de MySQL: {}".format(e))
+        lcd_mostrar("Error BD", "Sin conexion", (255, 0, 0))
         time.sleep(3)
         lcd_apagar()
         return
 
-    with open(ARCHIVO_DATOS, "r", newline="") as f:
-        filas = list(csv.reader(f))
-
-    if len(filas) <= 1:
-        lcd_mostrar("Sin datos", "Archivo vacio", (255, 255, 0))
+    if not filas:
+        lcd_mostrar("Sin datos", "Base vacia", (255, 255, 0))
         time.sleep(3)
         lcd_apagar()
         return
 
     print("--- HISTORIAL DE MEDIDAS (orden cronologico) ---")
-    for fila in filas[1:]:
-        print("[{}] Temp: {} C | Hum: {} %".format(fila[0], fila[1], fila[2]))
+    for fecha, temp, hum in filas:
+        print("[{}] Temp: {} C | Hum: {} %".format(fecha, temp, hum))
 
-    ultima = filas[-1]
+    _, ultima_temp, ultima_hum = filas[-1]
     lcd_mostrar(
-        "Ultima: T:{} C".format(ultima[1]),
-        "Humedad: {} %".format(ultima[2]),
+        "Ultima: T:{} C".format(ultima_temp),
+        "Humedad: {} %".format(ultima_hum),
         (0, 255, 255),
     )
     time.sleep(5)
@@ -195,13 +237,18 @@ def mostrar_mediciones():
 
 
 def borrar_mediciones():
-    """3 aplausos: borra el CSV, pita largo y muestra 'Datos Borrados' en rojo."""
+    """3 aplausos: borra todos los registros, pita largo y muestra 'Datos Borrados' en rojo."""
     print("\n[3 aplausos] Borrando todo el historial...")
-    if os.path.exists(ARCHIVO_DATOS):
-        os.remove(ARCHIVO_DATOS)
-        print("-> Archivo {} eliminado.".format(ARCHIVO_DATOS))
-    else:
-        print("-> El archivo ya estaba vacio.")
+    try:
+        conexion = conectar_bd()
+        cursor = conexion.cursor()
+        cursor.execute("DELETE FROM mediciones")
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        print("-> Todos los registros fueron eliminados de la base de datos.")
+    except pymysql.MySQLError as e:
+        print("-> Error al borrar en MySQL: {}".format(e))
 
     lcd_mostrar("Datos", "Borrados", (255, 0, 0))
     pitido(1.0)
